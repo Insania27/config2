@@ -21,3 +21,25 @@
 Тест:
 
 ![screen3](stage2.png)
+
+
+**Этап 3. Основные операции**
+
+Цель: построить граф зависимостей (с учетом транзитивности) и выполнить 
+основные операции над ним.
+
+Файл graph1.txt
+
+![screen4](graph1.png)
+
+Тест:
+
+![screen5](test_graph1.png)
+
+Файл graph2.txt
+
+![screen6](graph2.png)
+
+Тест:
+
+![screen7](graph2_test.png)

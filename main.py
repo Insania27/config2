@@ -8,15 +8,15 @@ import re
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Анализатор зависимостей пакетов (этап 2)",
+        description="Анализатор зависимостей пакетов (этап 3)",
         add_help=False
     )
 
-    parser.add_argument("--package", required=True, help="Имя анализируемого пакета")
-    parser.add_argument("--repo", required=True, help="URL репозитория или путь к локальной директории/файлу")
-    parser.add_argument("--mode", required=True, choices=["clone", "local"], help="Режим работы с репозиторием")
-    parser.add_argument("--max-depth", required=True, type=int, help="Максимальная глубина анализа зависимостей")
-    parser.add_argument("--filter", required=False, default="", help="Фильтр (не используется на этом этапе)")
+    parser.add_argument("--package", required=True, help="Имя анализируемого пакета (или стартовая вершина в test mode)")
+    parser.add_argument("--repo", required=True, help="Git URL / локальный путь / путь к test-файлу (в режиме test)")
+    parser.add_argument("--mode", required=True, choices=["clone", "local", "test"], help="Режим работы с репозиторием")
+    parser.add_argument("--max-depth", required=True, type=int, help="Максимальная глубина анализа зависимостей (0..N)")
+    parser.add_argument("--filter", required=False, default="", help="Подстрока для исключения пакетов; '-' трактуется как пустой фильтр")
 
     if "-h" in sys.argv or "--help" in sys.argv:
         parser.print_help()
@@ -27,19 +27,23 @@ def parse_arguments():
     if args.max_depth < 0:
         parser.error("--max-depth must be non-negative.")
 
+    if args.filter == "-":
+        args.filter = ""
+
     return args
+
 
 def run_git_clone(repo_url, dest_dir):
     try:
         subprocess.check_call(["git", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         raise RuntimeError("git is not available on PATH.")
-
     try:
         subprocess.check_call(["git", "clone", "--depth", "1", repo_url, dest_dir],
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"git clone failed: {e.stderr.decode().strip() if isinstance(e.stderr, bytes) else str(e)}")
+
 
 def find_cargo_tomls(root_dir):
     matches = []
@@ -48,7 +52,7 @@ def find_cargo_tomls(root_dir):
             matches.append(os.path.join(dirpath, "Cargo.toml"))
     return matches
 
-def read_file(path):
+def read_file_lines(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().splitlines()
@@ -59,19 +63,19 @@ def parse_toml_package_name(lines):
     in_package = False
     name_re = re.compile(r'^\s*name\s*=\s*["\']([^"\']+)["\']')
     for line in lines:
-        line_strip = line.strip()
-        if line_strip.startswith("[") and line_strip.lower().startswith("[package"):
+        s = line.strip()
+        if s.startswith("[") and s.lower().startswith("[package"):
             in_package = True
             continue
         if in_package:
-            if line_strip.startswith("["):
+            if s.startswith("["):
                 break
             m = name_re.match(line)
             if m:
                 return m.group(1)
     return None
 
-def extract_dependencies(lines):
+def parse_toml_dependencies(lines):
     deps = set()
     in_dependencies = False
     dep_section_re = re.compile(r'^\s*\[dependencies\]\s*$', re.IGNORECASE)
@@ -110,50 +114,126 @@ def extract_dependencies(lines):
                 deps.add(m.group(1))
     return sorted(deps)
 
-def locate_package_cargo_toml(root_dir, package_name):
+
+def parse_test_graph_file(path):
+    if not os.path.exists(path):
+        raise RuntimeError(f"Test graph file not found: {path}")
+    graph = {}
+    for raw in read_file_lines(path):
+        line = raw.split("#",1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise RuntimeError(f"Bad line in test file (expected 'A: B C'): {raw}")
+        left, right = line.split(":",1)
+        node = left.strip()
+        if not node:
+            continue
+        deps = [tok for tok in right.strip().split() if tok]
+        graph[node] = deps
+    return graph
+
+
+def build_graph_from_repo(root_dir):
     tomls = find_cargo_tomls(root_dir)
-    if not tomls:
-        raise RuntimeError("No Cargo.toml found in repository.")
-    for path in tomls:
-        lines = read_file(path)
+    packages = {}
+    name_to_path = {}
+    for t in tomls:
+        lines = read_file_lines(t)
         name = parse_toml_package_name(lines)
-        if name == package_name:
-            return path
-    if len(tomls) == 1:
-        return tomls[0]
-    for path in tomls:
-        if os.path.basename(os.path.dirname(path)) == package_name:
-            return path
-    raise RuntimeError(f"Cargo.toml for package '{package_name}' not found.")
+        deps = parse_toml_dependencies(lines)
+        if name:
+            packages[name] = deps
+            name_to_path[name] = t
+    all_nodes = dict((k, list(v)) for k, v in packages.items())
+    for deps in packages.values():
+        for d in deps:
+            if d not in all_nodes:
+                all_nodes[d] = []
+    return all_nodes
+
+
+def bfs_recursive_levels(start, graph, max_depth, filter_substr):
+    visited = set()
+    levels = []
+
+    if filter_substr and filter_substr in start:
+        return visited, levels
+
+    levels.append([start])
+    visited.add(start)
+
+    def recurse(frontier, depth):
+        if depth >= max_depth:
+            return
+        next_frontier = []
+        for node in frontier:
+            for nbr in graph.get(node, []):
+                if filter_substr and filter_substr in nbr:
+                    continue
+                if nbr not in visited:
+                    visited.add(nbr)
+                    next_frontier.append(nbr)
+        if next_frontier:
+            levels.append(next_frontier)
+            recurse(next_frontier, depth + 1)
+
+    recurse(levels[0], 0)
+    return visited, levels
+
+def collect_edges_within_levels(levels, graph):
+    edges = []
+    nodes_set = set()
+    for lvl in levels:
+        nodes_set.update(lvl)
+    for node in nodes_set:
+        for nbr in graph.get(node, []):
+            if nbr in nodes_set:
+                edges.append((node, nbr))
+    return edges
+
 
 def main():
     try:
         args = parse_arguments()
+
         workdir = None
+        graph = {}
+
         try:
             if args.mode == "clone":
                 workdir = tempfile.mkdtemp(prefix="repo_clone_")
                 run_git_clone(args.repo, workdir)
-            else:
+                graph = build_graph_from_repo(workdir)
+            elif args.mode == "local":
                 if not os.path.exists(args.repo):
                     raise RuntimeError(f"Local path does not exist: {args.repo}")
-                if os.path.isfile(args.repo):
-                    if os.path.basename(args.repo).lower() == "cargo.toml":
-                        workdir = os.path.dirname(os.path.abspath(args.repo))
-                    else:
-                        raise RuntimeError("Provided file is not Cargo.toml")
+                if os.path.isfile(args.repo) and os.path.basename(args.repo).lower() == "cargo.toml":
+                    base = os.path.dirname(os.path.abspath(args.repo))
+                    graph = build_graph_from_repo(base)
                 else:
-                    workdir = os.path.abspath(args.repo)
+                    graph = build_graph_from_repo(os.path.abspath(args.repo))
+            else:
+                graph = parse_test_graph_file(args.repo)
 
-            cargo_toml_path = locate_package_cargo_toml(workdir, args.package)
-            lines = read_file(cargo_toml_path)
-            deps = extract_dependencies(lines)
+            start = args.package
+            if start not in graph:
 
-            if args.filter:
-                deps = [d for d in deps if args.filter in d]
+                if args.mode == "test":
+                    raise RuntimeError(f"Start node '{start}' not found in test graph.")
+                else:
+                    graph.setdefault(start, [])
 
-            for d in deps:
-                print(d)
+            visited, levels = bfs_recursive_levels(start, graph, args.max_depth, args.filter)
+
+            edges = collect_edges_within_levels(levels, graph)
+
+            for a, b in sorted(edges):
+                print(f"{a} -> {b}")
+
+            if levels:
+                for i, lvl in enumerate(levels):
+                    print(f"Level {i}: {' '.join(lvl)}")
 
         finally:
             if args.mode == "clone" and workdir and os.path.isdir(workdir):
